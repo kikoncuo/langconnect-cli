@@ -403,5 +403,164 @@ def split(
     typer.echo(f"📁 Output directory: {os.path.abspath(output_dir)}")
 
 
+async def _upload_documents_batch(collection_id: str, doc_files: List[str], batch_size: int = 50) -> None:
+    """Upload documents in batches to avoid overwhelming the API."""
+    
+    typer.echo(f"Found {len(doc_files)} documents to upload")
+    typer.echo(f"Uploading to collection: {collection_id}")
+    
+    # Initialize client
+    client = LangConnectClient()
+    
+    total_batches = (len(doc_files) + batch_size - 1) // batch_size
+    
+    for batch_num in range(total_batches):
+        start_idx = batch_num * batch_size
+        end_idx = min(start_idx + batch_size, len(doc_files))
+        batch_files = doc_files[start_idx:end_idx]
+        
+        typer.echo(f"Uploading batch {batch_num + 1}/{total_batches} (files {start_idx + 1}-{end_idx})")
+        
+        try:
+            # Upload this batch
+            result = await client.upload_documents(
+                collection_id=collection_id,
+                files=batch_files,
+                chunk_size=1000,
+                chunk_overlap=200
+            )
+            
+            if result:
+                typer.echo(f"✓ Batch {batch_num + 1} uploaded successfully")
+            else:
+                typer.secho(f"✗ Batch {batch_num + 1} failed to upload", fg=typer.colors.RED)
+                
+        except Exception as e:
+            typer.secho(f"✗ Error uploading batch {batch_num + 1}: {e}", fg=typer.colors.RED)
+        
+        # Small delay between batches to be gentle on the API
+        await asyncio.sleep(1)
+    
+    typer.echo("Upload process completed!")
+
+
+@app.command()
+def upload(
+    collection_id: str = typer.Argument(..., help="UUID of the collection to upload to"),
+    input_path: str = typer.Argument(..., help="Path to folder containing documents to upload"),
+    batch_size: int = typer.Option(50, "--batch-size", "-b", help="Number of documents to upload per batch"),
+) -> None:
+    """Upload documents from a folder to a collection.
+    
+    Uploads all .txt documents from the specified folder to the given collection.
+    
+    Examples:
+        # Upload documents to a specific collection
+        langconnect-cli upload 706b5ed3-670f-4e58-95a5-35e3eb33351d ./documents/
+        
+        # Upload with custom batch size
+        langconnect-cli upload 706b5ed3-670f-4e58-95a5-35e3eb33351d ./documents/ --batch-size 25
+    """
+    input_path = Path(input_path)
+    
+    if not input_path.exists():
+        typer.secho(f"Error: Input path '{input_path}' does not exist.", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    
+    if not input_path.is_dir():
+        typer.secho(f"Error: Input path '{input_path}' is not a directory.", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    
+    # Get all document files
+    doc_files = sorted(glob.glob(str(input_path / "document_*.txt")))
+    
+    if not doc_files:
+        typer.secho(f"Error: No document files found in '{input_path}'", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    
+    # Run the upload process
+    try:
+        _run_async(_upload_documents_batch(collection_id, doc_files, batch_size))
+        typer.echo(f"\n🎉 Successfully uploaded {len(doc_files)} documents to collection {collection_id}")
+    except Exception as e:
+        typer.secho(f"Upload failed: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+
+@app.command("upload-all")
+def upload_all(
+    base_folder: str = typer.Argument(..., help="Base folder containing subfolders with documents"),
+    batch_size: int = typer.Option(50, "--batch-size", "-b", help="Number of documents to upload per batch"),
+) -> None:
+    """Upload documents from multiple folders to corresponding collections.
+    
+    Looks for subfolders in the base folder and uploads documents to collections
+    with matching names (prefixed with 'iqvia-').
+    
+    Examples:
+        # Upload all documents from out_docs to corresponding collections
+        langconnect-cli upload-all ./out_docs/
+        
+        # Upload with custom batch size
+        langconnect-cli upload-all ./out_docs/ --batch-size 25
+    """
+    base_folder = Path(base_folder)
+    
+    if not base_folder.exists():
+        typer.secho(f"Error: Base folder '{base_folder}' does not exist.", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    
+    if not base_folder.is_dir():
+        typer.secho(f"Error: Base folder '{base_folder}' is not a directory.", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    
+    # Get all subdirectories
+    subdirs = [d for d in base_folder.iterdir() if d.is_dir()]
+    
+    if not subdirs:
+        typer.secho(f"Error: No subdirectories found in '{base_folder}'", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    
+    total_uploaded = 0
+    
+    for subdir in subdirs:
+        collection_name = f"iqvia-{subdir.name}"
+        typer.echo(f"\n📁 Processing folder: {subdir.name}")
+        
+        # Get collection ID by listing collections and finding matching name
+        try:
+            client = LangConnectClient()
+            collections = _run_async(client.list_collections())
+            
+            collection_id = None
+            for collection in collections or []:
+                if collection.get("name") == collection_name:
+                    collection_id = collection.get("uuid")
+                    break
+            
+            if not collection_id:
+                typer.secho(f"⚠️  Collection '{collection_name}' not found, skipping...", fg=typer.colors.YELLOW)
+                continue
+            
+            # Get document files from this subdirectory
+            doc_files = sorted(glob.glob(str(subdir / "document_*.txt")))
+            
+            if not doc_files:
+                typer.secho(f"⚠️  No documents found in '{subdir}', skipping...", fg=typer.colors.YELLOW)
+                continue
+            
+            typer.echo(f"📤 Uploading {len(doc_files)} documents to collection '{collection_name}'")
+            
+            # Upload documents
+            _run_async(_upload_documents_batch(collection_id, doc_files, batch_size))
+            total_uploaded += len(doc_files)
+            
+        except Exception as e:
+            typer.secho(f"✗ Error processing '{subdir.name}': {e}", fg=typer.colors.RED)
+            continue
+    
+    typer.echo(f"\n🎉 Successfully uploaded {total_uploaded} documents across {len(subdirs)} collections!")
+
+
 if __name__ == "__main__":
     app()
