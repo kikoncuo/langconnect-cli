@@ -27,6 +27,7 @@ A powerful command-line interface to interact with the LangConnect API, designed
    Create a `.env` file in the project root with your LangConnect credentials:
    ```env
    LANGCONNECT_BASE_URL=https://your-langconnect-instance.com
+   LANGCONNECT_API_KEY=your-api-key
    LANGCONNECT_ADMIN_EMAIL=your-admin@email.com
    LANGCONNECT_ADMIN_PASSWORD=your-password
    ```
