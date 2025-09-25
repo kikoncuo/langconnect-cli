@@ -27,36 +27,76 @@ class LangConnectClient:
         admin_password: Optional[str] = None,
         timeout: int = 90,
     ) -> None:
-        base = base_url or _env("LANGCONNECT_API_URL")
+        base = base_url or _env("LANGCONNECT_BASE_URL")
         self.base_url = base[:-1] if base.endswith("/") else base
-        self.admin_email = admin_email or _env("LANGCONNECT_ADMIN_EMAIL")
-        self.admin_password = admin_password or _env("LANGCONNECT_ADMIN_PASSWORD")
+        self.api_key = _env("LANGCONNECT_API_KEY")
+        if not self.api_key:
+            self.admin_email = admin_email or _env("LANGCONNECT_ADMIN_EMAIL")
+            self.admin_password = admin_password or _env("LANGCONNECT_ADMIN_PASSWORD")
+        else:
+            self.admin_email = None
+            self.admin_password = None
         self.timeout = timeout
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.headers: Dict[str, str] = {}
-
-    def _update_auth_header(self) -> None:
-        if self.access_token:
-            self.headers["Authorization"] = f"Bearer {self.access_token}"
-        else:
-            self.headers.pop("Authorization", None)
+        if self.api_key:
+            self.headers["Authorization"] = f"Bearer {self.api_key}"            
 
     async def signin(self) -> bool:
         """Authenticate using admin credentials."""
+        if self.api_key:
+            logger.info('Logging using API KEY...')
+            return True
+        
+        if not self.admin_email or not self.admin_password:
+             logger.error("Admin email or password not configured. Cannot sign in.")
+             return False
+
         payload = {"email": self.admin_email, "password": self.admin_password}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(f"{self.base_url}/auth/signin", json=payload)
+            try:
+                response = await client.post(f"{self.base_url}/auth/signin", json=payload)
+                response.raise_for_status()
+            except httpx.RequestError as exc:
+                logger.error(f"Request to signin endpoint failed: {exc}")
+                return False
 
         if response.status_code == 200:
             data = response.json()
             self.access_token = data.get("access_token")
             self.refresh_token = data.get("refresh_token")
-            self._update_auth_header()
+            await self._update_auth_header()
             return True
 
         logger.error("Failed to sign in: %s - %s", response.status_code, response.text)
         return False
+    
+    async def _ensure_authenticated(self) -> None:
+        """
+        Ensures that the client is authenticated before making a request.
+        If not authenticated, it will attempt to sign in.
+        """
+        if "Authorization" in self.headers:
+            return
+
+        if not self.access_token:
+            logger.info("No active session or API key. Trying to sign-in...")
+            if not await self.signin():
+                raise LangConnectRequestError("Authentication failed. Provide a valid API KEY or admin credentials in the .env file.")
+    
+    async def _update_auth_header(self) -> None:
+        """
+        Sets or clears the authorization header based on the current auth state.
+        Priority: API KEY > Access Token
+        """
+        if self.api_key:
+            self.headers["Authorization"] = f"Bearer {self.api_key}"
+        elif self.access_token:
+            self.headers["Authorization"] = f"Bearer {self.access_token}"
+        else:
+            # If no credentials are available, remove the header to invalidate the session.
+            self.headers.pop("Authorization", None)
 
     async def refresh_access_token(self) -> bool:
         if not self.refresh_token:
@@ -72,27 +112,23 @@ class LangConnectClient:
             data = response.json()
             self.access_token = data.get("access_token")
             self.refresh_token = data.get("refresh_token")  # Update refresh token as well
-            self._update_auth_header()
+            await self._update_auth_header()
             return True
 
         logger.error("Failed to refresh token: %s - %s", response.status_code, response.text)
         return False
 
-    async def _ensure_authenticated(self) -> None:
-        if self.access_token:
-            return
-        if not await self.signin():
-            raise LangConnectRequestError("Authentication with LangConnect failed.")
-
     async def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         await self._ensure_authenticated()
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.get(self._build_url(endpoint), headers=self.headers, params=params)
-
-        if response.status_code == 200:
-            return response.json() if response.content else None
-
-        logger.error("GET %s failed: %s - %s", endpoint, response.status_code, response.text)
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(self._build_url(endpoint), headers=self.headers, params=params)
+                response.raise_for_status()
+                return response.json() if response.content else None
+        except httpx.HTTPStatusError as exc:
+            logger.error("GET %s failed: %s - %s", endpoint, exc.response.status_code, exc.response.text)
+        except httpx.RequestError as exc:
+            logger.error(f"Request failed for GET {endpoint}: {exc}")
         return None
 
     async def post(
@@ -149,7 +185,7 @@ class LangConnectClient:
             data = response.json()
             self.access_token = data.get("access_token")
             self.refresh_token = data.get("refresh_token")
-            self._update_auth_header()
+            await self._update_auth_header()
             return data
 
         logger.error("Failed to sign up: %s - %s", response.status_code, response.text)
@@ -164,7 +200,7 @@ class LangConnectClient:
         if response.status_code == 200:
             self.access_token = None
             self.refresh_token = None
-            self._update_auth_header()
+            await self._update_auth_header()
             return True
 
         logger.error("Failed to sign out: %s - %s", response.status_code, response.text)
@@ -271,12 +307,21 @@ class LangConnectClient:
         logger.error("POST documents failed: %s - %s", response.status_code, response.text)
         return None
 
-    async def search_documents(self, collection_id: str, query: str, limit: int = 10, search_type: str = "semantic", filter_dict: Optional[Dict[str, Any]] = None) -> Optional[List[Dict[str, Any]]]:
+    async def search_documents(
+        self, 
+        collection_id: str, 
+        query: str, 
+        limit: int = 10, 
+        search_type: str = "semantic", 
+        filter_dict: Optional[Dict[str, Any]] = None,
+        language: str = "es"
+    ) -> Optional[List[Dict[str, Any]]]:
         """Search documents in a collection."""
         payload = {
             "query": query,
             "limit": limit,
-            "search_type": search_type
+            "search_type": search_type,
+            "language": language
         }
         if filter_dict:
             payload["filter"] = filter_dict

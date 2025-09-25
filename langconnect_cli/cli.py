@@ -67,7 +67,10 @@ def main(
     ctx: typer.Context,
     verbose: int = typer.Option(0, "-v", "--verbose", count=True, help="Increase verbosity (repeatable)."),
 ) -> None:
-    """CLI entrypoint configuring logging verbosity."""
+    """
+    CLI entrypoint configuring logging verbosity.
+    Authentication can be handled via --api-key, or email/password.
+    """
     _configure_logging(verbose)
     ctx.obj = {"verbose": verbose}
 
@@ -280,11 +283,12 @@ def search_documents(
     query: str = typer.Argument(..., help="Search query"),
     limit: int = typer.Option(10, "--limit", "-l", help="Maximum number of results"),
     search_type: str = typer.Option("semantic", "--type", "-t", help="Search type: semantic, keyword, or hybrid"),
+    language: str = typer.Option("es", "--language", "-lang", help="Language of the query (e.g., 'es', 'en').")
 ) -> None:
     """Search documents in a collection."""
     try:
         client = LangConnectClient()
-        response = _run_async(client.search_documents(collection_id, query, limit, search_type))
+        response = _run_async(client.search_documents(collection_id, query, limit, search_type, language=language))
     except (MissingEnvironmentVariable, LangConnectRequestError) as exc:
         raise typer.Exit(code=1) from exc
 
